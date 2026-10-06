@@ -9,6 +9,12 @@
 整份替换速度点表；发布时锁定锚点偏移超过录入时一 tick 即 **422**，
 修订号过期即 **409**；数据保存在 **SQLite**，Compose 重启后仍可读取。
 
+还可为已保存的谱例**安排排练提示**：创建排练时提交谱例 ID 与若干
+“乐谱位置 + 文字”的提示，客户端用从排练开始累计的非负秒数**领取到点
+提示**——每次按谱例**当前已提交**的速度图计算未发提示的触发秒数；
+进度只能前进（重复领取不重发、倒退 **409**），速度图发布后**已发提示
+不撤回、未发提示按新修订重新定时**，发放记录与所用修订号一并落库。
+
 - 位置中的“拍”按**当前拍号分母**对应的音符计（6/8 中一拍 = 八分音符）；
 - 内部统一展开为“距乐谱起点的 **tick 坐标**”（PPQ：每四分音符的 tick 数）；
 - 线性速度段按解析积分换算，反向换算在**同一速度段内解析求逆**；
@@ -25,6 +31,7 @@
 - [本地直接运行](#本地直接运行)
 - [接口地址与交互式文档](#接口地址与交互式文档)
 - [录音锚点修订：创建 / 预览 / 发布](#录音锚点修订创建--预览--发布)
+- [排练提示：创建排练 / 领取到点提示](#排练提示创建排练--领取到点提示)
 - [约定与规则](#约定与规则)
 - [请求字段](#请求字段)
 - [响应字段](#响应字段)
@@ -52,6 +59,9 @@ docker compose up --build
 - 预览修订：`POST http://localhost:8000/scores/{id}/revisions/{rev}/preview`
 - 发布修订：`POST http://localhost:8000/scores/{id}/revisions/{rev}/publish`
 - 查询谱例：`GET  http://localhost:8000/scores/{id}`
+- 创建排练：`POST http://localhost:8000/rehearsals`
+- 领取到点提示：`POST http://localhost:8000/rehearsals/{id}/claims`
+- 查询排练：`GET  http://localhost:8000/rehearsals/{id}`
 - Swagger 交互文档：<http://localhost:8000/docs>
 - ReDoc：<http://localhost:8000/redoc>
 - OpenAPI Schema：<http://localhost:8000/openapi.json>
@@ -60,6 +70,7 @@ docker compose up --build
 `tempo-data`：`docker compose down`（保留卷）后再 `up`，已创建与发布的
 修订仍可读取；如需清空，执行 `docker compose down -v`。数据库路径可用
 环境变量 `TEMPO_DB_PATH` 覆盖（本地裸跑默认 `./data/tempo.db`）。
+**排练与提示发放记录**保存在同一数据库中，重启后可继续领取。
 
 停止：`docker compose down`（后台运行：`docker compose up --build -d`）。
 
@@ -267,6 +278,164 @@ curl -s http://localhost:8000/scores/$SID
 - `original_seconds` / `tick_seconds` 是创建时冻结值，任何修订都不变；
   锁定锚点的 `current_seconds` 也保持冻结值，未锁定锚点随发布更新。
 - 谱例不存在时返回 **404**。
+
+---
+
+## 排练提示：创建排练 / 领取到点提示
+
+为已保存的谱例安排排练提示：创建排练时登记若干“乐谱位置 + 文字”的
+提示，排练过程中客户端用**从排练开始累计的非负秒数**轮询领取到点提示。
+
+### 规则
+
+1. **创建** `POST /rehearsals`：提交 `score_id` 与 `cues`
+   （每项 `{position, text}`，至少一条；位置按谱例的 PPQ 与拍号校验，
+   非法位置返回带 `index` 的 **422**，谱例不存在返回 **404**）。
+   服务端把每个位置展开为 tick 坐标落库（PPQ/拍号随谱例固定，坐标不随
+   速度图修订改变），返回排练 `id` 与归零的领取进度。
+2. **领取** `POST /rehearsals/{id}/claims`：提交
+   `{"elapsed_seconds": <从排练开始累计的非负秒数>}`。服务端按谱例
+   **当前已提交**的速度图计算**未发**提示的触发秒数，把
+   `trigger_seconds <= elapsed_seconds` 的提示标记为已发放，返回本次
+   新发放的提示（文字、位置、触发秒数、所用修订号），**按触发时间及
+   录入顺序排列**；响应顶层 `revision` 即本次计算到点所用的谱例修订号。
+3. **进度只能前进**：`elapsed_seconds` 小于已领取进度返回 **409**
+   （响应体含 `current_elapsed_seconds`）且**数据不变**；等于当前进度
+   的重复领取合法，已发提示**不会重发**（无新到点时 `cues` 为空数组）。
+4. **发布速度图后**：已发提示**不撤回**（发放记录保留当时的触发秒数与
+   修订号），未发提示在下次领取时**按新修订重新定时**——因此加速发布后，
+   用**同一秒数**再领一次也可能领到按新图提前到点的提示。
+5. **一致性**：领取是单事务（`BEGIN IMMEDIATE` 与发布、其他领取互斥），
+   计算到点所用的修订号与本次发放记录必然一致；并发领取同一提示最多
+   返回一次（发放记录以 `(rehearsal_id, cue_index)` 为主键）。
+6. **查询** `GET /rehearsals/{id}`：返回提示表、当前领取进度与全部
+   发放记录（同一读事务快照）。排练与发放记录保存在同一 SQLite，
+   **Compose 重启后仍可继续领取**。
+
+### HTTP 调用示例
+
+以下沿用上一节创建的谱例（`$SID`，rev0 为 120 BPM：一小节 2.0 s）。
+
+#### 1）创建排练（返回排练 ID）
+
+```bash
+RID=$(curl -s -X POST http://localhost:8000/rehearsals \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "score_id": "'$SID'",
+    "cues": [
+      {"position": "1:1:0", "text": "全体就位"},
+      {"position": "2:1:0", "text": "进入副歌"},
+      {"position": "3:1:0", "text": "间奏开始"}
+    ]
+  }' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+```
+
+```json
+{
+  "id": "4830d443301240e497d547d7e4493f56",
+  "score_id": "ac0224ce71d34c90bbe6f3a917602bbe",
+  "elapsed_seconds": 0.0,
+  "cues": [
+    {"index": 0, "position": "1:1:0", "text": "全体就位", "total_ticks": 0},
+    {"index": 1, "position": "2:1:0", "text": "进入副歌", "total_ticks": 1920},
+    {"index": 2, "position": "3:1:0", "text": "间奏开始", "total_ticks": 3840}
+  ],
+  "issues": []
+}
+```
+
+#### 2）按累计秒数领取到点提示
+
+120 BPM 下 `1:1:0`=0 s、`2:1:0`=2 s，排练进行到 2.5 s 时：
+
+```bash
+curl -s -X POST http://localhost:8000/rehearsals/$RID/claims \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 2.5}'
+```
+
+```json
+{
+  "id": "4830d443301240e497d547d7e4493f56",
+  "elapsed_seconds": 2.5,
+  "revision": 0,
+  "cues": [
+    {"index": 0, "position": "1:1:0", "text": "全体就位",
+     "trigger_seconds": 0.0, "revision": 0},
+    {"index": 1, "position": "2:1:0", "text": "进入副歌",
+     "trigger_seconds": 2.0, "revision": 0}
+  ]
+}
+```
+
+**同一秒数重复领取**不重发（`cues` 为空）；**倒退**返回 409 且数据不变：
+
+```bash
+curl -s -X POST http://localhost:8000/rehearsals/$RID/claims \
+  -H 'Content-Type: application/json' -d '{"elapsed_seconds": 2.5}'
+# {"id": "...", "elapsed_seconds": 2.5, "revision": 0, "cues": []}
+
+curl -i -X POST http://localhost:8000/rehearsals/$RID/claims \
+  -H 'Content-Type: application/json' -d '{"elapsed_seconds": 1.0}'
+# HTTP/1.1 409 Conflict
+# {"detail": [{"loc": ["body", "elapsed_seconds"],
+#   "msg": "领取进度只能前进：本次 1.0s 早于已领取的 2.5s",
+#   "index": null, "current_elapsed_seconds": 2.5}]}
+```
+
+#### 3）发布新速度图：已发不撤回，未发按新修订重新定时
+
+把速度发布为 60 BPM（rev0 → rev1，`3:1:0` 由 4 s 变为 8 s）：
+
+```bash
+curl -s -X POST http://localhost:8000/scores/$SID/revisions/0/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"tempo_points": [{"position": "1:1:0", "bpm": 60, "curve": "step"}]}'
+
+# 新图下 5.0 s 时第三条提示尚未到点
+curl -s -X POST http://localhost:8000/rehearsals/$RID/claims \
+  -H 'Content-Type: application/json' -d '{"elapsed_seconds": 5.0}'
+# {"elapsed_seconds": 5.0, "revision": 1, "cues": [], ...}
+
+# 8.0 s 到点，按新修订（rev1）定时
+curl -s -X POST http://localhost:8000/rehearsals/$RID/claims \
+  -H 'Content-Type: application/json' -d '{"elapsed_seconds": 8.0}'
+```
+
+```json
+{
+  "elapsed_seconds": 8.0,
+  "revision": 1,
+  "cues": [
+    {"index": 2, "position": "3:1:0", "text": "间奏开始",
+     "trigger_seconds": 8.0, "revision": 1}
+  ]
+}
+```
+
+#### 4）查询排练与发放记录
+
+```bash
+curl -s http://localhost:8000/rehearsals/$RID
+```
+
+`issues` 中已发提示保留**发放当时**的触发秒数与修订号（前两条为
+rev0 的 0 s / 2 s，第三条为 rev1 的 8 s），不随后续发布改变：
+
+```json
+{
+  "elapsed_seconds": 8.0,
+  "issues": [
+    {"index": 0, "trigger_seconds": 0.0, "revision": 0, "elapsed_seconds": 2.5},
+    {"index": 1, "trigger_seconds": 2.0, "revision": 0, "elapsed_seconds": 2.5},
+    {"index": 2, "trigger_seconds": 8.0, "revision": 1, "elapsed_seconds": 8.0}
+  ]
+}
+```
+
+`docker compose down`（保留卷）后再 `up`，领取进度与发放记录仍在，
+可从上次的 `elapsed_seconds` 继续领取。
 
 ---
 
@@ -558,6 +727,15 @@ BPM=0、速度点位置重复、拍号分母不是 2 的幂，会在同一个 42
   “该位置录入时一个 tick 的时长”，按上述 422 格式返回并带锚点 `index`，
   速度图、锚点秒数与修订号均不变。
 
+排练接口还可能返回：
+
+- **404**：排练 ID 不存在（`detail[0].loc` 指向 `path.rehearsal_id`），
+  或创建排练时谱例 ID 不存在（指向 `body.score_id`）；
+- **409**：领取进度倒退（`elapsed_seconds` 小于已领取进度），响应体含
+  `current_elapsed_seconds`，进度与发放记录均不变；
+- **422**：提示位置非法（带 `index`）、提示表为空、提示文字为空白、
+  `elapsed_seconds` 为负或非有限值。
+
 ---
 
 ## 运行测试
@@ -580,6 +758,13 @@ Simpson 数值积分交叉校验，误差 ~1e-14）、同段反求与边界归�
 另一连接真实提交一次发布，断言返回的修订号、速度点与全部锚点秒数取自
 同一快照（完整旧修订或完整新修订），不发生跨修订拼接。
 
+排练提示测试（`tests/test_rehearsals.py`）覆盖：创建校验（位置带索引
+422、空表/空白文字 422、谱例 404）、按触发时间及录入顺序排序、进度
+前进与重复领取不重发、倒退 409 且数据不变、发布后已发不撤回且未发按
+新修订重新定时（含同一秒数再领）、发放记录修订号与交错发布的一致性、
+多连接并发领取同一提示最多发放一次，以及换新 Store（模拟 Compose 重启）
+后继续领取。
+
 ## 项目结构
 
 ```
@@ -588,12 +773,13 @@ Simpson 数值积分交叉校验，误差 ~1e-14）、同段反求与边界归�
 │   ├── __init__.py
 │   ├── main.py        # FastAPI 路由、请求/响应模型、422/409/404 错误处理
 │   ├── tempo.py       # 核心引擎：拍号展开、积分换算、同段求逆、校验
-│   └── db.py          # SQLite 持久化：谱例/锚点/修订号，乐观锁原子发布
+│   └── db.py          # SQLite 持久化：谱例/锚点/修订号、排练/提示/发放记录
 ├── tests/
 │   ├── conftest.py    # 测试用临时 SQLite（TEMPO_DB_PATH）
 │   ├── test_tempo.py  # 引擎数值/往返/校验测试
 │   ├── test_api.py    # /convert 端到端测试
-│   └── test_scores.py # 修订创建/预览/发布/查询与持久化测试
+│   ├── test_scores.py # 修订创建/预览/发布/查询与持久化测试
+│   └── test_rehearsals.py # 排练创建/领取/进度/并发与持久化测试
 ├── Dockerfile
 ├── docker-compose.yml # 命名卷 tempo-data -> /data（TEMPO_DB_PATH）
 ├── requirements.txt

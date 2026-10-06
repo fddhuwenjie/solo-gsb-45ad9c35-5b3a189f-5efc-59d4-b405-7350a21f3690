@@ -1,4 +1,4 @@
-"""FastAPI 入口：POST /convert 速度图换算。
+"""FastAPI 入口：POST /convert 速度图换算；谱例修订；排练提示领取。
 
 启动：uvicorn app.main:app --host 0.0.0.0 --port 8000
 """
@@ -13,7 +13,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .db import RevisionConflict, ScoreNotFound, Store
+from .db import (
+    ClaimBackward,
+    RehearsalNotFound,
+    RevisionConflict,
+    ScoreNotFound,
+    Store,
+)
 from .tempo import TempoMap, TempoMapError, build_tempo_map
 
 app = FastAPI(
@@ -21,9 +27,11 @@ app = FastAPI(
     description=(
         "在乐谱位置（小节:拍:tick，拍按当前拍号分母对应的音符计）与秒数之间换算，"
         "支持阶梯（step）与线性（linear）BPM 速度点、拍号表及 PPQ；"
-        "并提供带录音锚点的速度图修订（创建/预览/发布，乐观锁修订号）。"
+        "并提供带录音锚点的速度图修订（创建/预览/发布，乐观锁修订号）；"
+        "以及为已保存谱例安排排练提示（创建排练、按累计秒数领取到点提示，"
+        "未发提示随速度图修订重新定时）。"
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 # SQLite 持久化（默认 ./data/tempo.db，可用 TEMPO_DB_PATH 覆盖；
@@ -252,6 +260,7 @@ async def root() -> dict:
         "docs": "/docs",
         "convert": "/convert",
         "scores": "/scores",
+        "rehearsals": "/rehearsals",
     }
 
 
@@ -600,3 +609,264 @@ async def get_score(score_id: str):
     except ScoreNotFound:
         return _not_found(score_id)
     return ScoreOut.model_validate(score)
+
+
+# ---------------------------------------------------------------------- #
+# 排练提示：创建排练 / 领取到点提示 / 查询
+# ---------------------------------------------------------------------- #
+class CueInput(BaseModel):
+    """排练提示：乐谱位置 + 文字。触发秒数由服务端按速度图计算。"""
+
+    position: str = Field(
+        ...,
+        description=(
+            "提示的乐谱位置 '小节:拍:tick'（拍按当前拍号分母计），如 2:1:0；"
+            "创建时按谱例的 PPQ 与拍号校验并展开为 tick 坐标"
+        ),
+    )
+    text: str = Field(..., description="提示文字（非空白）")
+
+
+class RehearsalCreateRequest(BaseModel):
+    score_id: str = Field(..., description="已保存的谱例 ID")
+    cues: list[CueInput] = Field(
+        ..., description="提示表；至少一条，位置按谱例当前拍号校验"
+    )
+
+
+class CueOut(BaseModel):
+    index: int
+    position: str
+    text: str
+    total_ticks: int = Field(..., description="提示位置距起点的 tick 总数（PPQ 坐标）")
+
+
+class IssueOut(BaseModel):
+    index: int = Field(..., description="已发放提示的下标（录入顺序）")
+    trigger_seconds: float = Field(
+        ..., description="发放时按当时速度图修订计算的触发秒数"
+    )
+    revision: int = Field(..., description="计算触发秒数所用的谱例修订号")
+    elapsed_seconds: float = Field(..., description="领取时客户端提交的累计秒数")
+
+
+class RehearsalOut(BaseModel):
+    id: str
+    score_id: str
+    elapsed_seconds: float = Field(
+        ..., description="当前领取进度（从排练开始累计的秒数，只能前进）"
+    )
+    cues: list[CueOut]
+    issues: list[IssueOut] = Field(..., description="已发放记录（不随修订撤回）")
+
+
+class ClaimRequest(BaseModel):
+    elapsed_seconds: float = Field(
+        ...,
+        description="从排练开始累计的非负秒数；只能前进，倒退返回 409",
+    )
+
+
+class IssuedCueOut(BaseModel):
+    index: int
+    position: str
+    text: str
+    trigger_seconds: float = Field(
+        ..., description="按本次所用速度图修订计算的触发秒数"
+    )
+    revision: int = Field(..., description="计算触发秒数所用的谱例修订号")
+
+
+class ClaimResponse(BaseModel):
+    id: str
+    elapsed_seconds: float = Field(..., description="领取后的进度（秒）")
+    revision: int = Field(..., description="本次计算到点所用的谱例修订号")
+    cues: list[IssuedCueOut] = Field(
+        ..., description="本次新发放的到点提示，按触发时间及录入顺序排列"
+    )
+
+
+def _rehearsal_not_found(rehearsal_id: str) -> JSONResponse:
+    return _error_response(
+        [
+            {
+                "loc": ["path", "rehearsal_id"],
+                "msg": f"排练 {rehearsal_id} 不存在",
+                "index": None,
+            }
+        ],
+        status_code=404,
+    )
+
+
+@app.post("/rehearsals", response_model=RehearsalOut, status_code=201)
+async def create_rehearsal(req: RehearsalCreateRequest):
+    """为已保存的谱例创建排练：校验全部提示位置并返回排练 ID。"""
+    try:
+        score = store.get_score(req.score_id)
+    except ScoreNotFound:
+        return _error_response(
+            [
+                {
+                    "loc": ["body", "score_id"],
+                    "msg": f"谱例 {req.score_id} 不存在",
+                    "index": None,
+                }
+            ],
+            status_code=404,
+        )
+
+    if not req.cues:
+        raise TempoMapError(
+            [
+                {
+                    "loc": ["body", "cues"],
+                    "msg": "至少需要一条提示",
+                    "index": None,
+                }
+            ]
+        )
+
+    # 位置校验沿用与 /convert 相同的拍号坐标规则（PPQ/拍号随谱例固定，
+    # 展开的 tick 坐标不随速度图修订改变）。
+    tmap = _build_map(score["ppq"], score["time_signatures"], score["tempo_points"])
+    cue_rows: list[dict] = []
+    cue_errors: list[dict] = []
+    for i, c in enumerate(req.cues):
+        base = ("body", "cues", i)
+        if not c.text.strip():
+            cue_errors.append(
+                {
+                    "loc": ["body", "cues", i, "text"],
+                    "msg": "提示文字不能为空白",
+                    "index": i,
+                }
+            )
+        try:
+            total_ticks = tmap.mbt_to_ticks(c.position, loc=(*base, "position"))
+        except TempoMapError as exc:
+            for e in exc.errors:
+                e["index"] = i
+                cue_errors.append(e)
+            continue
+        cue_rows.append(
+            {"position": c.position, "text": c.text, "total_ticks": total_ticks}
+        )
+    if cue_errors:
+        raise TempoMapError(cue_errors)
+
+    try:
+        rehearsal = store.create_rehearsal(req.score_id, cue_rows)
+    except ScoreNotFound:
+        return _error_response(
+            [
+                {
+                    "loc": ["body", "score_id"],
+                    "msg": f"谱例 {req.score_id} 不存在",
+                    "index": None,
+                }
+            ],
+            status_code=404,
+        )
+    return RehearsalOut.model_validate(rehearsal)
+
+
+@app.post("/rehearsals/{rehearsal_id}/claims", response_model=ClaimResponse)
+async def claim_rehearsal_cues(rehearsal_id: str, req: ClaimRequest):
+    """用从排练开始累计的非负秒数领取到点提示。
+
+    每次按谱例**当前已提交**的速度图计算未发提示的触发秒数；已发提示
+    不撤回、不重发。进度只能前进：同一秒数重复领取返回空列表，倒退
+    返回 409 且数据不变。
+    """
+    elapsed = req.elapsed_seconds
+    if not (
+        isinstance(elapsed, (int, float))
+        and not isinstance(elapsed, bool)
+        and math.isfinite(elapsed)
+        and elapsed >= 0
+    ):
+        raise TempoMapError(
+            [
+                {
+                    "loc": ["body", "elapsed_seconds"],
+                    "msg": "elapsed_seconds 必须是有限的非负数",
+                    "index": None,
+                }
+            ]
+        )
+    elapsed = float(elapsed)
+
+    def compute_due(score: dict, pending: list[dict]) -> list[dict]:
+        """在领取事务内用同一快照的谱例修订计算未发提示的触发秒数。"""
+        tmap = _build_map(
+            score["ppq"], score["time_signatures"], score["tempo_points"]
+        )
+        # 浮点容差（约 1e-9）：客户端按上次返回值原样回传同一秒数时
+        # 边界提示仍视为到点。
+        tolerance = 1e-9 * max(1.0, abs(elapsed))
+        due = []
+        for c in pending:
+            trigger = tmap.seconds_at_tick(c["total_ticks"])
+            if trigger <= elapsed + tolerance:
+                due.append({**c, "trigger_seconds": trigger})
+        # 按触发时间及录入顺序排列。
+        due.sort(key=lambda d: (d["trigger_seconds"], d["cue_index"]))
+        return due
+
+    try:
+        result = store.claim_cues(rehearsal_id, elapsed, compute_due)
+    except RehearsalNotFound:
+        return _rehearsal_not_found(rehearsal_id)
+    except ScoreNotFound:
+        return _error_response(
+            [
+                {
+                    "loc": ["path", "rehearsal_id"],
+                    "msg": "排练关联的谱例不存在",
+                    "index": None,
+                }
+            ],
+            status_code=404,
+        )
+    except ClaimBackward as exc:
+        return _error_response(
+            [
+                {
+                    "loc": ["body", "elapsed_seconds"],
+                    "msg": (
+                        f"领取进度只能前进：本次 {elapsed}s 早于"
+                        f"已领取的 {exc.current}s"
+                    ),
+                    "index": None,
+                    "current_elapsed_seconds": exc.current,
+                }
+            ],
+            status_code=409,
+        )
+
+    return ClaimResponse(
+        id=result["id"],
+        elapsed_seconds=result["elapsed_seconds"],
+        revision=result["revision"],
+        cues=[
+            IssuedCueOut(
+                index=d["cue_index"],
+                position=d["position"],
+                text=d["text"],
+                trigger_seconds=d["trigger_seconds"],
+                revision=result["revision"],
+            )
+            for d in result["cues"]
+        ],
+    )
+
+
+@app.get("/rehearsals/{rehearsal_id}", response_model=RehearsalOut)
+async def get_rehearsal(rehearsal_id: str):
+    """查询排练：提示、领取进度与发放记录（同一读事务快照）。"""
+    try:
+        rehearsal = store.get_rehearsal(rehearsal_id)
+    except RehearsalNotFound:
+        return _rehearsal_not_found(rehearsal_id)
+    return RehearsalOut.model_validate(rehearsal)
