@@ -9,6 +9,13 @@
 整份替换速度点表；发布时锁定锚点偏移超过录入时一 tick 即 **422**，
 修订号过期即 **409**；数据保存在 **SQLite**，Compose 重启后仍可读取。
 
+还可为已保存的谱例安排**排练提示**：创建排练时提交若干提示的乐谱位置
+与文字（位置随谱例拍号校验），客户端用**从排练开始累计的非负秒数**
+领取到点提示；每次领取按谱例**当前已提交的速度图**给未发提示定时，
+返回提示文字、位置、触发秒数与所用修订号；**进度只前进**（重复领取
+不重发、倒退 **409**），发布后**已发提示不撤回、未发提示按新修订
+重新定时**；排练与发放记录同样保存在 SQLite，重启后可继续领取。
+
 - 位置中的“拍”按**当前拍号分母**对应的音符计（6/8 中一拍 = 八分音符）；
 - 内部统一展开为“距乐谱起点的 **tick 坐标**”（PPQ：每四分音符的 tick 数）；
 - 线性速度段按解析积分换算，反向换算在**同一速度段内解析求逆**；
@@ -25,6 +32,7 @@
 - [本地直接运行](#本地直接运行)
 - [接口地址与交互式文档](#接口地址与交互式文档)
 - [录音锚点修订：创建 / 预览 / 发布](#录音锚点修订创建--预览--发布)
+- [排练提示：创建排练 / 领取到点提示](#排练提示创建排练--领取到点提示)
 - [约定与规则](#约定与规则)
 - [请求字段](#请求字段)
 - [响应字段](#响应字段)
@@ -52,14 +60,18 @@ docker compose up --build
 - 预览修订：`POST http://localhost:8000/scores/{id}/revisions/{rev}/preview`
 - 发布修订：`POST http://localhost:8000/scores/{id}/revisions/{rev}/publish`
 - 查询谱例：`GET  http://localhost:8000/scores/{id}`
+- 创建排练：`POST http://localhost:8000/rehearsals`
+- 领取到点提示：`POST http://localhost:8000/rehearsals/{id}/claims`
+- 查询排练：`GET  http://localhost:8000/rehearsals/{id}`
 - Swagger 交互文档：<http://localhost:8000/docs>
 - ReDoc：<http://localhost:8000/redoc>
 - OpenAPI Schema：<http://localhost:8000/openapi.json>
 
-谱例与锚点保存在容器内 `/data/tempo.db`（SQLite），并挂载到命名卷
-`tempo-data`：`docker compose down`（保留卷）后再 `up`，已创建与发布的
-修订仍可读取；如需清空，执行 `docker compose down -v`。数据库路径可用
-环境变量 `TEMPO_DB_PATH` 覆盖（本地裸跑默认 `./data/tempo.db`）。
+谱例、锚点、排练与发放记录保存在容器内 `/data/tempo.db`（SQLite），
+并挂载到命名卷 `tempo-data`：`docker compose down`（保留卷）后再 `up`，
+已创建与发布的修订、已领取的进度仍可读取；如需清空，执行
+`docker compose down -v`。数据库路径可用环境变量 `TEMPO_DB_PATH`
+覆盖（本地裸跑默认 `./data/tempo.db`）。
 
 停止：`docker compose down`（后台运行：`docker compose up --build -d`）。
 
@@ -267,6 +279,177 @@ curl -s http://localhost:8000/scores/$SID
 - `original_seconds` / `tick_seconds` 是创建时冻结值，任何修订都不变；
   锁定锚点的 `current_seconds` 也保持冻结值，未锁定锚点随发布更新。
 - 谱例不存在时返回 **404**。
+
+---
+
+## 排练提示：创建排练 / 领取到点提示
+
+适用于“为已保存的谱例安排排练提示，客户端按排练累计秒数领取到点提示”
+的场景。提示位置在创建排练时校验并展开为 tick 坐标（PPQ/拍号沿用谱例
+创建时的值，不随速度图修订变化）；**触发秒数在每次领取时**按谱例
+**当前已提交的速度图**现算。
+
+### 规则
+
+1. **创建排练** `POST /rehearsals`：提交 `score_id` 与提示表 `cues`
+   （每项 `{position, text}`，至少一个，文字去空白后非空）。位置按谱例
+   的 PPQ/拍号校验（与 `/convert`、锚点同一套规则），非法位置/空文字
+   返回带 `index` 的 **422**；谱例不存在返回 **404**。返回排练 `id`
+   与全部提示（含展开后的 `total_ticks`）。
+2. **领取** `POST /rehearsals/{id}/claims`：提交从排练开始累计的
+   `elapsed_seconds`（非负、有限，否则 **422**）。服务端在**单个写事务**
+   内读出谱例当前已提交的速度图与修订号，计算全部**未发**提示的触发
+   秒数，发放 `trigger_seconds <= elapsed_seconds` 的提示，返回提示
+   文字、位置、触发秒数与**所用修订号**，按**触发秒数及录入顺序**排列。
+3. **进度只前进**：`elapsed_seconds` 小于已领取进度返回 **409**
+   （响应体含 `last_elapsed_seconds`，**状态不变**）；等于已领取进度
+   可重复领取，但**已发提示不会重发**（若发布把未发提示提前到进度内，
+   会在此刻补发）。
+4. **发布后重定时**：速度图发布后，**已发提示不撤回**（发放记录中的
+   触发秒数与修订号保持发放时的值）；**未发提示**在下一次领取时按
+   **新修订**重新定时。领取的读-算-写在同一事务内完成，与发布交错时
+   二者必居其一，**计算到点所用的修订必然等于写入发放记录的修订**；
+   并发领取被串行化，同一提示**最多发放一次**（发放记录主键兜底）。
+5. **查询** `GET /rehearsals/{id}`：返回已领取进度与每条提示的发放
+   状态（`delivered` / `trigger_seconds` / `revision`）。
+6. 排练与发放记录保存在 **SQLite**（`rehearsals` / `rehearsal_cues` /
+   `cue_deliveries` 表，与谱例同库同卷），Compose 重启后可继续领取。
+
+### HTTP 调用示例
+
+以下沿用上文创建的谱例（`$SID`，120 BPM、4/4、PPQ=480：一拍 0.5 s、
+一小节 2.0 s）。
+
+#### 1）创建排练（返回排练 ID）
+
+```bash
+curl -s -X POST http://localhost:8000/rehearsals \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "score_id": "'$SID'",
+    "cues": [
+      {"position": "2:1:0", "text": "进副歌"},
+      {"position": "3:1:0", "text": "渐慢准备"}
+    ]
+  }'
+```
+
+```json
+{
+  "id": "7c9e1b2f4a5d4e8f9c0a1b2c3d4e5f6a",
+  "score_id": "ac0224ce71d34c90bbe6f3a917602bbe",
+  "last_elapsed_seconds": 0.0,
+  "cues": [
+    {"index": 0, "position": "2:1:0", "text": "进副歌", "total_ticks": 1920,
+     "delivered": false, "trigger_seconds": null, "revision": null},
+    {"index": 1, "position": "3:1:0", "text": "渐慢准备", "total_ticks": 3840,
+     "delivered": false, "trigger_seconds": null, "revision": null}
+  ]
+}
+```
+
+位置非法（如 `1:9:0` 超出 4/4 拍数）或文字为空时返回带 `index` 的 422。
+
+#### 2）排练进行到 2.5 s：领取到点提示
+
+```bash
+RID=7c9e1b2f4a5d4e8f9c0a1b2c3d4e5f6a
+curl -s -X POST http://localhost:8000/rehearsals/$RID/claims \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 2.5}'
+```
+
+`2:1:0` 在 120 BPM 下触发于 2.0 s（已到点），`3:1:0` 触发于 4.0 s
+（未到点）：
+
+```json
+{
+  "id": "7c9e1b2f4a5d4e8f9c0a1b2c3d4e5f6a",
+  "elapsed_seconds": 2.5,
+  "revision": 0,
+  "cues": [
+    {"index": 0, "position": "2:1:0", "text": "进副歌",
+     "trigger_seconds": 2.0, "revision": 0}
+  ]
+}
+```
+
+#### 3）重复领取与倒退
+
+同一时刻（或进度内）重复领取不会重发已发提示：
+
+```bash
+curl -s -X POST http://localhost:8000/rehearsals/$RID/claims \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 2.5}'
+# {"id": "...", "elapsed_seconds": 2.5, "revision": 0, "cues": []}
+```
+
+倒退请求返回 **409** 且状态不变：
+
+```bash
+curl -i -X POST http://localhost:8000/rehearsals/$RID/claims \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 1.0}'
+# HTTP/1.1 409 Conflict
+# {"detail": [{"loc": ["body", "elapsed_seconds"],
+#   "msg": "领取进度只能前进：本次 1.0s 早于已领取进度 2.5s",
+#   "index": null, "elapsed_seconds": 1.0, "last_elapsed_seconds": 2.5}]}
+```
+
+#### 4）发布新速度图：未发提示按新修订重新定时
+
+把整体速度放慢到 60 BPM（触发秒数翻倍）：
+
+```bash
+curl -s -X POST http://localhost:8000/scores/$SID/revisions/0/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"tempo_points": [{"position": "1:1:0", "bpm": 60, "curve": "step"}]}'
+```
+
+已发的“进副歌”（2.0 s，rev0）**不撤回、不重发**；未发的“渐慢准备”
+在新图下重新定时为 8.0 s——排练进行到 8.0 s 时领取：
+
+```bash
+curl -s -X POST http://localhost:8000/rehearsals/$RID/claims \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 8.0}'
+```
+
+```json
+{
+  "id": "7c9e1b2f4a5d4e8f9c0a1b2c3d4e5f6a",
+  "elapsed_seconds": 8.0,
+  "revision": 1,
+  "cues": [
+    {"index": 1, "position": "3:1:0", "text": "渐慢准备",
+     "trigger_seconds": 8.0, "revision": 1}
+  ]
+}
+```
+
+#### 5）查询排练状态
+
+```bash
+curl -s http://localhost:8000/rehearsals/$RID
+```
+
+```json
+{
+  "id": "7c9e1b2f4a5d4e8f9c0a1b2c3d4e5f6a",
+  "score_id": "ac0224ce71d34c90bbe6f3a917602bbe",
+  "last_elapsed_seconds": 8.0,
+  "cues": [
+    {"index": 0, "position": "2:1:0", "text": "进副歌", "total_ticks": 1920,
+     "delivered": true, "trigger_seconds": 2.0, "revision": 0},
+    {"index": 1, "position": "3:1:0", "text": "渐慢准备", "total_ticks": 3840,
+     "delivered": true, "trigger_seconds": 8.0, "revision": 1}
+  ]
+}
+```
+
+注意“进副歌”的发放记录保持发放时的修订与触发秒数（rev0 / 2.0 s），
+即使速度图已切换到 60 BPM——已发提示不随发布改变。
 
 ---
 
@@ -558,6 +741,22 @@ BPM=0、速度点位置重复、拍号分母不是 2 的幂，会在同一个 42
   “该位置录入时一个 tick 的时长”，按上述 422 格式返回并带锚点 `index`，
   速度图、锚点秒数与修订号均不变。
 
+排练接口还可能返回：
+
+- **404**：谱例 ID（创建排练时）或排练 ID（领取/查询时）不存在，
+  `detail[0].loc` 分别指向 `path.score_id` / `path.rehearsal_id`；
+- **409**：领取秒数早于已领取进度（倒退），状态不变：
+
+  ```json
+  {"detail": [{"loc": ["body", "elapsed_seconds"],
+               "msg": "领取进度只能前进：本次 1.0s 早于已领取进度 2.5s",
+               "index": null,
+               "elapsed_seconds": 1.0, "last_elapsed_seconds": 2.5}]}
+  ```
+
+- **422**：提示位置非法或文字为空（带提示 `index`）、`elapsed_seconds`
+  为负或非有限值、提示表为空。
+
 ---
 
 ## 运行测试
@@ -580,6 +779,14 @@ Simpson 数值积分交叉校验，误差 ~1e-14）、同段反求与边界归�
 另一连接真实提交一次发布，断言返回的修订号、速度点与全部锚点秒数取自
 同一快照（完整旧修订或完整新修订），不发生跨修订拼接。
 
+排练提示测试（`tests/test_rehearsals.py`）覆盖：创建校验位置/文字并返回
+排练 ID（404/422 带索引）、到点领取与按触发秒数及录入顺序排序、边界
+触发时刻、负/非有限秒数 422、同一时刻重复领取不重发、倒退 409 且状态
+不变、发布后已发不撤回而未发按新修订重新定时（发放记录修订与计算所用
+修订一致）、同刻补发被提前的未发提示、**多连接并发领取同一提示最多
+发放一次**，以及新 Store 实例（模拟 Compose 重启）后进度保留、可继续
+领取。
+
 ## 项目结构
 
 ```
@@ -588,12 +795,14 @@ Simpson 数值积分交叉校验，误差 ~1e-14）、同段反求与边界归�
 │   ├── __init__.py
 │   ├── main.py        # FastAPI 路由、请求/响应模型、422/409/404 错误处理
 │   ├── tempo.py       # 核心引擎：拍号展开、积分换算、同段求逆、校验
-│   └── db.py          # SQLite 持久化：谱例/锚点/修订号，乐观锁原子发布
+│   └── db.py          # SQLite 持久化：谱例/锚点/修订号乐观锁原子发布，
+│                      #   排练/提示/发放记录单事务领取
 ├── tests/
 │   ├── conftest.py    # 测试用临时 SQLite（TEMPO_DB_PATH）
 │   ├── test_tempo.py  # 引擎数值/往返/校验测试
 │   ├── test_api.py    # /convert 端到端测试
-│   └── test_scores.py # 修订创建/预览/发布/查询与持久化测试
+│   ├── test_scores.py # 修订创建/预览/发布/查询与持久化测试
+│   └── test_rehearsals.py # 排练创建/领取/进度/并发与持久化测试
 ├── Dockerfile
 ├── docker-compose.yml # 命名卷 tempo-data -> /data（TEMPO_DB_PATH）
 ├── requirements.txt
